@@ -20,43 +20,6 @@ class ForwardPassSettingWrapper(nn.Module):
         return self.module(*args, **self.settings)
 
 
-# for S2-MLP type models.
-# input: [batch_size, channels, height, width]
-class SpatialShift2d(nn.Module):
-    def __init__(
-            self,
-            shift_directions=[[1,0], [-1,0], [0,1], [0,-1]], # List of shift directions. [X, Y], if you need to identity mapping, set this value [0, 0]
-            padding_mode='replicate',
-            ):
-        super(SpatialShift2d, self).__init__()
-        # caluclate padding range. I like one-line code lol.
-        (l, r), (t, b) = [[f(d) for f in [lambda a:abs(min(a+[0])), lambda b:abs(max(*b+[0]))]] for d in [list(c) for c in zip(*shift_directions)]]
-        self.pad_size = [l, r, t, b]
-        self.num_directions = len(shift_directions)
-        self.shift_directions = shift_directions
-        self.padding_mode = padding_mode
-
-    def forward(
-            self,
-            x,
-            ):
-        x = F.pad(x, self.pad_size, mode=self.padding_mode) # pad
-        # caluclate channels of each section
-        c = x.shape[1]
-        sections = [c//self.num_directions]*self.num_directions
-        # concatenate remainder of channels to last section
-        sections[-1] += c % self.num_directions
-        # save height and width
-        h, w = x.shape[2], x.shape[3]
-
-        # split
-        x = torch.split(x, sections, dim=1)
-
-        l,r,t,b = self.pad_size
-        # clip each sections.
-        x = torch.cat([s[:, :, t:h-b, l:w-r] for (s, d) in zip(x, self.shift_directions)], dim=1)
-        return x
-
 class Conv2dMod(nn.Module):
     def __init__(self, input_channels, output_channels, kernel_size=3, eps=1e-8, groups=1, demodulation=True):
         super(Conv2dMod, self).__init__()
@@ -145,39 +108,6 @@ class ChannelMLPMod(nn.Module):
         x = self.c_mlp(x, self.affine(style))
         return x
 
-class GeneratorBlock(nn.Module):
-    def __init__(self, input_channels, output_channels, style_dim, num_layers=6, upscale=True):
-        super(GeneratorBlock, self).__init__()
-        blocks = []
-        self.mod_layers = []
-        self.ch_conv = nn.Conv2d(input_channels, output_channels, 1, 1, 0)
-        self.upscale = nn.Upsample(scale_factor=2) if upscale else nn.Identity()
-        self.to_rgb = nn.Conv2d(output_channels, 3, 1, 1, 0)
-        for i in range(num_layers):
-            mod_layer = ForwardPassSettingWrapper(ChannelMLPMod(output_channels, style_dim))
-            b = rv.ReversibleBlock(
-                    SpatialShift2d(),
-                    nn.Sequential(
-                        mod_layer,
-                        nn.GELU(),
-                        ),
-                    split_along_dim=1
-                    )
-            blocks.append(b)
-            self.mod_layers.append(mod_layer)
-        self.seq = rv.ReversibleSequence(nn.ModuleList(blocks))
-
-    def forward(self, x, y):
-        x = self.ch_conv(x)
-        x = self.upscale(x)
-        for ml in self.mod_layers:
-            ml.settings = {'style' : y}
-        x = torch.repeat_interleave(x, repeats=2, dim=1)
-        x = self.seq(x)
-        x1, x2 = torch.chunk(x, 2, dim=1)
-        x = (x1 + x2) / 2
-        return x
-
 class Blur(nn.Module):
     def __init__(self):
         super(Blur, self).__init__()
@@ -198,32 +128,60 @@ class Blur(nn.Module):
         x = x.reshape(shape)
         return x
 
+class GeneratorBlock(nn.Module):
+    def __init__(self, input_channels, output_channels, style_dim, num_layers=6, upscale=True):
+        super(GeneratorBlock, self).__init__()
+        blocks = []
+        self.mod_layers = []
+        self.ch_conv = nn.Conv2d(input_channels, output_channels, 1, 1, 0)
+        self.upscale = nn.Upsample(scale_factor=2) if upscale else nn.Identity()
+        self.to_rgb = nn.Conv2d(output_channels, 3, 1, 1, 0)
+        self.blur = Blur()
+        for i in range(num_layers):
+            mod_layer = ForwardPassSettingWrapper(ChannelMLPMod(output_channels, style_dim))
+            b = rv.ReversibleBlock(
+                    nn.Conv2d(output_channels, output_channels, 3, 1, 1),
+                    nn.Sequential(
+                        mod_layer,
+                        nn.GELU(),
+                        ),
+                    split_along_dim=1
+                    )
+            blocks.append(b)
+            self.mod_layers.append(mod_layer)
+        self.seq = rv.ReversibleSequence(nn.ModuleList(blocks))
+
+    def forward(self, x, y):
+        x = self.ch_conv(x)
+        x = self.upscale(x)
+        for ml in self.mod_layers:
+            ml.settings = {'style' : y}
+        x = torch.repeat_interleave(x, repeats=2, dim=1)
+        x = self.seq(x)
+        x1, x2 = torch.chunk(x, 2, dim=1)
+        x = (x1 + x2) / 2
+        x = self.blur(x)
+        return x
+
+
 class Generator(nn.Module):
-    def __init__(self, style_dim=512, channels=[512, 512, 256, 256, 128, 64, 64, 32], num_layers_per_block=6):
+    def __init__(self, style_dim=512, channels=[512, 512, 256, 256, 128, 64, 64, 32], num_layers_per_block=4):
         super(Generator, self).__init__()
         self.channels = channels
         self.style_dim = style_dim
         self.num_layers_per_block = num_layers_per_block
-        self.initial_image = nn.Parameter(torch.rand(1, channels[0], 4, 4))
+        self.initial_image = nn.Parameter(torch.randn(1, channels[0], 4, 4))
         self.last_layer_channels = channels[0]
         self.layers = nn.ModuleList([])
         self.add_layer(False)
-        self.upscale = nn.Sequential(nn.Upsample(scale_factor=2), Blur())
-        self.alpha = 0.
 
     def forward(self, style):
-        if self.alpha < 1.0:
-            self.alpha += 1e-2
         if type(style) != list:
             style = [style] * len(self.layers)
         x = self.initial_image.repeat(style[0].shape[0], 1, 1, 1)
-        rgb = None
         for i, l in enumerate(self.layers):
             x = l(x, style[i])
-            if rgb == None:
-                rgb = l.to_rgb(x) * self.alpha
-            else:
-                rgb = self.upscale(rgb) + l.to_rgb(x)
+        rgb = self.layers[-1].to_rgb(x)
         return rgb
 
     def add_layer(self, upscale=True):
@@ -239,8 +197,8 @@ class DiscriminatorBlock(nn.Module):
         self.ch_conv = nn.Conv2d(input_channels, output_channels, 1, 1, 0)
         self.from_rgb = nn.Conv2d(3, input_channels, 1, 1, 0)
         blocks = nn.ModuleList([rv.ReversibleBlock(
-                SpatialShift2d(),
-                nn.Sequential(
+                 nn.Conv2d(output_channels, output_channels, 3, 1, 1, groups=output_channels),
+                 nn.Sequential(
                     nn.Conv2d(output_channels, output_channels, 1, 1, 0),
                     nn.GELU()
                     ),
@@ -258,7 +216,7 @@ class DiscriminatorBlock(nn.Module):
         return x
 
 class Discriminator(nn.Module):
-    def __init__(self, channels=[32, 64, 64, 128, 256, 256, 512, 512], num_layers_per_block=6):
+    def __init__(self, channels=[32, 64, 64, 128, 256, 256, 512, 512], num_layers_per_block=4):
         super(Discriminator, self).__init__()
         self.channels = channels
         self.layers = nn.ModuleList([])
@@ -385,3 +343,32 @@ class GAN(nn.Module):
                 break
             self.generator.add_layer()
             self.discriminator.add_layer()
+
+    def generate_random_image(self, num_images):
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        images = []
+        for i in range(num_images):
+            z1 = torch.randn(1, self.style_dim).to(device)
+            z2 = torch.randn(1, self.style_dim).to(device)
+            w1 = self.mapping_network(z1)
+            w2 = self.mapping_network(z2)
+            L = len(self.generator.layers)
+            mid = random.randint(1, L)
+            style = [w1] * mid + [w2] * (L-mid)
+            image = self.generator(style)
+            image = image.detach().cpu().numpy()
+            images.append(image[0])
+        return images
+
+    def generate_random_image_to_directory(self, num_images, dir_path="./tests"):
+        images = self.generate_random_image(num_images)
+        if not os.path.exists(dir_path):
+            os.mkdir(dir_path)
+        for i in range(num_images):
+            image = images[i]
+            image = np.transpose(image, (1, 2, 0))
+            image = image * 127.5 + 127.5
+            image = image.astype(np.uint8)
+            image = Image.fromarray(image, mode='RGB')
+            image = image.resize((256, 256))
+            image.save(os.path.join(dir_path, f"{i}.png"))
