@@ -223,7 +223,7 @@ class Discriminator(nn.Module):
         self.last_layer_channels = channels[-1]
         self.num_layers_per_block = num_layers_per_block
         self.judge = nn.Sequential(
-                nn.Linear(channels[-1] + 1, 64),
+                nn.Linear(channels[-1] + 2, 64),
                 nn.GELU(),
                 nn.Linear(64, 1)
                 )
@@ -238,6 +238,8 @@ class Discriminator(nn.Module):
         self.last_layer_channels = oc
 
     def forward(self, rgb):
+        co_std = torch.std(rgb, dim=[0], keepdim=False).mean().unsqueeze(0).repeat(rgb.shape[0], 1) # Color Std.
+
         x = self.layers[0].from_rgb(rgb)
         for i, l in enumerate(self.layers):
             if i == 1:
@@ -246,7 +248,7 @@ class Discriminator(nn.Module):
         mb_std = torch.std(x, dim=[0], keepdim=False).mean().unsqueeze(0).repeat(x.shape[0], 1) # Minibatch Std.
         x = self.pool4x(x)
         x = x.view(x.shape[0], -1)
-        x = torch.cat([x, mb_std], dim=1)
+        x = torch.cat([x, mb_std, co_std], dim=1)
         x = self.judge(x)
         return x
 
@@ -278,8 +280,8 @@ class GAN(nn.Module):
             # train generator
             M.zero_grad()
             G.zero_grad()
-            z1 = torch.rand(N, self.style_dim, device=device, dtype=dtype) * 2 - 1
-            z2 = torch.rand(N, self.style_dim, device=device, dtype=dtype) * 2 - 1
+            z1 = torch.randn(N, self.style_dim, device=device, dtype=dtype)
+            z2 = torch.randn(N, self.style_dim, device=device, dtype=dtype)
             mid = random.randint(1, L)
             w1 = self.mapping_network(z1)
             w2 = self.mapping_network(z2)
