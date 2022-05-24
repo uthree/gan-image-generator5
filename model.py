@@ -136,19 +136,25 @@ class GeneratorBlock(nn.Module):
         self.ch_conv = nn.Conv2d(input_channels, output_channels, 1, 1, 0)
         self.upscale = nn.Upsample(scale_factor=2) if upscale else nn.Identity()
         self.to_rgb = nn.Conv2d(output_channels, 3, 1, 1, 0)
-        self.blur = Blur()
         for i in range(num_layers):
-            mod_layer = ForwardPassSettingWrapper(ChannelMLPMod(output_channels, style_dim))
+            mod_layer1 = ForwardPassSettingWrapper(ChannelMLPMod(output_channels, style_dim))
+            mod_layer2 = ForwardPassSettingWrapper(ChannelMLPMod(output_channels, style_dim))
             b = rv.ReversibleBlock(
-                    nn.Conv2d(output_channels, output_channels, 3, 1, 1),
                     nn.Sequential(
-                        mod_layer,
+                        nn.Conv2d(output_channels, output_channels, 3, 1, 1),
+                        mod_layer1,
+                        nn.GELU(),
+                        ),
+                    nn.Sequential(
+                        nn.Conv2d(output_channels, output_channels, 3, 1, 1),
+                        mod_layer2,
                         nn.GELU(),
                         ),
                     split_along_dim=1
                     )
             blocks.append(b)
-            self.mod_layers.append(mod_layer)
+            self.mod_layers.append(mod_layer1)
+            self.mod_layers.append(mod_layer2)
         self.seq = rv.ReversibleSequence(nn.ModuleList(blocks))
 
     def forward(self, x, y):
@@ -160,12 +166,11 @@ class GeneratorBlock(nn.Module):
         x = self.seq(x)
         x1, x2 = torch.chunk(x, 2, dim=1)
         x = (x1 + x2) / 2
-        x = self.blur(x)
         return x
 
 
 class Generator(nn.Module):
-    def __init__(self, style_dim=512, channels=[512, 512, 256, 256, 128, 64, 64, 32], num_layers_per_block=4):
+    def __init__(self, style_dim=512, channels=[512, 512, 256, 256, 128, 64, 64, 32], num_layers_per_block=2):
         super(Generator, self).__init__()
         self.channels = channels
         self.style_dim = style_dim
@@ -197,8 +202,13 @@ class DiscriminatorBlock(nn.Module):
         self.ch_conv = nn.Conv2d(input_channels, output_channels, 1, 1, 0)
         self.from_rgb = nn.Conv2d(3, input_channels, 1, 1, 0)
         blocks = nn.ModuleList([rv.ReversibleBlock(
-                 nn.Conv2d(output_channels, output_channels, 3, 1, 1, groups=output_channels),
-                 nn.Sequential(
+                nn.Sequential(
+                    nn.Conv2d(output_channels, output_channels, 3, 1, 1, groups=output_channels),
+                    nn.Conv2d(output_channels, output_channels, 1, 1, 0),
+                    nn.GELU()
+                    ),
+                nn.Sequential(
+                    nn.Conv2d(output_channels, output_channels, 3, 1, 1, groups=output_channels),
                     nn.Conv2d(output_channels, output_channels, 1, 1, 0),
                     nn.GELU()
                     ),
@@ -216,7 +226,7 @@ class DiscriminatorBlock(nn.Module):
         return x
 
 class Discriminator(nn.Module):
-    def __init__(self, channels=[32, 64, 64, 128, 256, 256, 512, 512], num_layers_per_block=4):
+    def __init__(self, channels=[32, 64, 64, 128, 256, 256, 512, 512], num_layers_per_block=2):
         super(Discriminator, self).__init__()
         self.channels = channels
         self.layers = nn.ModuleList([])
