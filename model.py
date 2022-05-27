@@ -129,24 +129,25 @@ class Blur(nn.Module):
         return x
 
 class GeneratorBlock(nn.Module):
-    def __init__(self, input_channels, output_channels, style_dim, num_layers=6, upscale=True):
+    def __init__(self, input_channels, output_channels, style_dim, num_layers=6, upscale=True, kernel_size=3):
         super(GeneratorBlock, self).__init__()
         blocks = []
         self.mod_layers = []
         self.ch_conv = nn.Conv2d(input_channels, output_channels, 1, 1, 0)
         self.upscale = nn.Upsample(scale_factor=2) if upscale else nn.Identity()
-        self.to_rgb = nn.Conv2d(output_channels, 3, 1, 1, 0)
+        self.to_rgb = Conv2dMod(output_channels, 3, kernel_size=1, demodulation=False)
+        self.to_rgb_affine = nn.Linear(style_dim, 3)
         for i in range(num_layers):
             mod_layer1 = ForwardPassSettingWrapper(ChannelMLPMod(output_channels, style_dim))
             mod_layer2 = ForwardPassSettingWrapper(ChannelMLPMod(output_channels, style_dim))
             b = rv.ReversibleBlock(
                     nn.Sequential(
-                        nn.Conv2d(output_channels, output_channels, 3, 1, 1),
+                        nn.Conv2d(output_channels, output_channels, kernel_size, 1, kernel_size//2, padding_mode='replicate'),
                         mod_layer1,
                         nn.GELU(),
                         ),
                     nn.Sequential(
-                        nn.Conv2d(output_channels, output_channels, 3, 1, 1),
+                        nn.Conv2d(output_channels, output_channels, kernel_size, 1, kernel_size//2, padding_mode='replicate'),
                         mod_layer2,
                         nn.GELU(),
                         ),
@@ -178,37 +179,43 @@ class Generator(nn.Module):
         self.initial_image = nn.Parameter(torch.randn(1, channels[0], 4, 4))
         self.last_layer_channels = channels[0]
         self.layers = nn.ModuleList([])
+        self.upscale = nn.Upsample(scale_factor=2)
         self.add_layer(False)
 
     def forward(self, style):
         if type(style) != list:
             style = [style] * len(self.layers)
         x = self.initial_image.repeat(style[0].shape[0], 1, 1, 1)
+        rgb = None
         for i, l in enumerate(self.layers):
             x = l(x, style[i])
-        rgb = self.layers[-1].to_rgb(x)
+            if rgb == None:
+                rgb = l.to_rgb(x, l.to_rgb_affine(style[i]))
+            else:
+                rgb = self.upscale(rgb) + l.to_rgb(x, l.to_rgb_affine(style[i]))
         return rgb
 
     def add_layer(self, upscale=True):
         idx = len(self.layers)
         ic, oc = self.channels[idx], self.channels[idx+1]
-        self.layers.append(GeneratorBlock(ic, oc, self.style_dim, self.num_layers_per_block, upscale))
+        ks = 3 if idx < 2 else 7
+        self.layers.append(GeneratorBlock(ic, oc, self.style_dim, self.num_layers_per_block, upscale, ks))
         self.last_layer_channels = oc
 
 class DiscriminatorBlock(nn.Module):
-    def __init__(self, input_channels, output_channels, num_layers=4, downscale=True):
+    def __init__(self, input_channels, output_channels, num_layers=4, downscale=True, kernel_size=3):
         super(DiscriminatorBlock, self).__init__()
         self.downscale = nn.AvgPool2d(kernel_size=2) if downscale else nn.Identity()
         self.ch_conv = nn.Conv2d(input_channels, output_channels, 1, 1, 0)
         self.from_rgb = nn.Conv2d(3, input_channels, 1, 1, 0)
         blocks = nn.ModuleList([rv.ReversibleBlock(
                 nn.Sequential(
-                    nn.Conv2d(output_channels, output_channels, 3, 1, 1, groups=output_channels),
+                    nn.Conv2d(output_channels, output_channels, kernel_size, 1, kernel_size//2, groups=output_channels, padding_mode='replicate'),
                     nn.Conv2d(output_channels, output_channels, 1, 1, 0),
                     nn.GELU()
                     ),
                 nn.Sequential(
-                    nn.Conv2d(output_channels, output_channels, 3, 1, 1, groups=output_channels),
+                    nn.Conv2d(output_channels, output_channels, kernel_size, 1, kernel_size//2,  groups=output_channels, padding_mode='replicate'),
                     nn.Conv2d(output_channels, output_channels, 1, 1, 0),
                     nn.GELU()
                     ),
@@ -233,7 +240,7 @@ class Discriminator(nn.Module):
         self.last_layer_channels = channels[-1]
         self.num_layers_per_block = num_layers_per_block
         self.judge = nn.Sequential(
-                nn.Linear(channels[-1] + 2, 64),
+                nn.Linear(channels[-1] + 1, 64),
                 nn.GELU(),
                 nn.Linear(64, 1)
                 )
@@ -244,12 +251,11 @@ class Discriminator(nn.Module):
     def add_layer(self, downscale=True):
         nl = len(self.layers)
         ic, oc = self.channels[-1-nl-1], self.channels[-1-nl]
-        self.layers.insert(0, DiscriminatorBlock(ic, oc, self.num_layers_per_block, downscale))
+        ks = 3 if nl < 2 else 7
+        self.layers.insert(0, DiscriminatorBlock(ic, oc, self.num_layers_per_block, downscale, ks))
         self.last_layer_channels = oc
 
     def forward(self, rgb):
-        co_std = torch.std(rgb, dim=[0], keepdim=False).mean().unsqueeze(0).repeat(rgb.shape[0], 1) # Color Std.
-
         x = self.layers[0].from_rgb(rgb)
         for i, l in enumerate(self.layers):
             if i == 1:
@@ -258,7 +264,7 @@ class Discriminator(nn.Module):
         mb_std = torch.std(x, dim=[0], keepdim=False).mean().unsqueeze(0).repeat(x.shape[0], 1) # Minibatch Std.
         x = self.pool4x(x)
         x = x.view(x.shape[0], -1)
-        x = torch.cat([x, mb_std, co_std], dim=1)
+        x = torch.cat([x, mb_std], dim=1)
         x = self.judge(x)
         return x
 
